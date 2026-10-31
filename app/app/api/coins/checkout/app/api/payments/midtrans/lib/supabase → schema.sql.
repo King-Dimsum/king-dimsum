@@ -1,0 +1,148 @@
+-- KING DIMSUM database foundation. Jalankan melalui Supabase SQL Editor.
+create extension if not exists pgcrypto;
+
+create table if not exists public.profiles (
+id uuid primary key references auth.users(id) on delete cascade,
+username text unique,
+role text not null default 'reader' check (role in ('reader','admin')),
+created_at timestamptz not null default now()
+);
+
+create table if not exists public.coin_wallets (
+user_id uuid primary key references auth.users(id) on delete cascade,
+balance bigint not null default 0 check (balance >= 0),
+updated_at timestamptz not null default now()
+);
+
+create table if not exists public.coin_orders (
+order_id text primary key,
+user_id uuid not null references auth.users(id),
+package_id text not null,
+coin_amount bigint not null check (coin_amount > 0),
+amount_idr bigint not null check (amount_idr > 0),
+status text not null default 'pending',
+midtrans_token text,
+payment_url text,
+provider_transaction_id text,
+created_at timestamptz not null default now(),
+paid_at timestamptz
+);
+
+create table if not exists public.coin_transactions (
+id uuid primary key default gen_random_uuid(),
+user_id uuid not null references auth.users(id),
+amount bigint not null,
+transaction_type text not null check (transaction_type in ('topup','chapter_unlock','refund','adjustment')),
+reference_id text not null unique,
+description text,
+created_at timestamptz not null default now()
+);
+
+create table if not exists public.comics (
+id uuid primary key default gen_random_uuid(),
+title text not null,
+slug text not null unique,
+synopsis text,
+cover_path text,
+status text not null default 'ongoing' check (status in ('ongoing','completed','hiatus')),
+is_published boolean not null default false,
+created_at timestamptz not null default now()
+);
+
+create table if not exists public.chapters (
+id uuid primary key default gen_random_uuid(),
+comic_id uuid not null references public.comics(id) on delete cascade,
+chapter_number numeric(8,2) not null,
+title text,
+coin_price integer not null default 0 check (coin_price >= 0),
+is_published boolean not null default false,
+published_at timestamptz,
+unique(comic_id, chapter_number)
+);
+
+create table if not exists public.chapter_pages (
+id uuid primary key default gen_random_uuid(),
+chapter_id uuid not null references public.chapters(id) on delete cascade,
+page_number integer not null check (page_number > 0),
+storage_path text not null,
+unique(chapter_id, page_number)
+);
+
+create table if not exists public.chapter_unlocks (
+user_id uuid not null references auth.users(id) on delete cascade,
+chapter_id uuid not null references public.chapters(id) on delete cascade,
+coin_price_paid integer not null,
+unlocked_at timestamptz not null default now(),
+primary key(user_id, chapter_id)
+);
+
+-- Buat profil + dompet saat akun baru terdaftar.
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = public
+as $$
+begin
+insert into public.profiles(id) values (new.id) on conflict do nothing;
+insert into public.coin_wallets(user_id) values (new.id) on conflict do nothing;
+return new;
+end;
+
+\[
+;  
+drop trigger if exists on_auth_user_created on auth.users;  
+create trigger on_auth_user_created after insert on auth.users  
+for each row execute procedure public.handle_new_user();  
+  
+-- Fungsi atomik + idempotent: notifikasi Midtrans berulang tidak menggandakan saldo.  
+create or replace function public.fulfill_coin_order(  
+  p_order_id text,  
+  p_provider_transaction_id text  
+) returns void  
+language plpgsql security definer set search_path = public  
+as 
+\]
+
+declare o public.coin_orders%rowtype;
+begin
+select * into o from public.coin_orders where order_id = p_order_id for update;
+if not found then raise exception 'Order not found'; end if;
+if o.status = 'paid' then return; end if;
+if o.status <> 'pending' then raise exception 'Order is not pending'; end if;
+insert into public.coin_wallets(user_id, balance)
+values (o.user_id, o.coin_amount)
+on conflict (user_id) do update
+set balance = public.coin_wallets.balance + excluded.balance,
+updated_at = now();
+
+insert into public.coin_transactions(user_id, amount, transaction_type, reference_id, description)
+values (o.user_id, o.coin_amount, 'topup', o.order_id, 'Top up KING COIN');
+
+update public.coin_orders
+set status = 'paid', provider_transaction_id = p_provider_transaction_id, paid_at = now()
+where order_id = p_order_id;
+end;
+
+\[
+;  
+  
+-- RLS: pembaca hanya melihat data dompet/order/transaksi miliknya.  
+alter table public.profiles enable row level security;  
+alter table public.coin_wallets enable row level security;  
+alter table public.coin_orders enable row level security;  
+alter table public.coin_transactions enable row level security;  
+alter table public.comics enable row level security;  
+alter table public.chapters enable row level security;  
+alter table public.chapter_pages enable row level security;  
+alter table public.chapter_unlocks enable row level security;  
+  
+create policy "read own profile" on public.profiles for select using (auth.uid() = id);  
+create policy "read own wallet" on public.coin_wallets for select using (auth.uid() = user_id);  
+create policy "read own orders" on public.coin_orders for select using (auth.uid() = user_id);  
+create policy "read own coin history" on public.coin_transactions for select using (auth.uid() = user_id);  
+create policy "public read published comics" on public.comics for select using (is_published = true);  
+create policy "public read published chapters" on public.chapters for select using (is_published = true);  
+create policy "read own unlocks" on public.chapter_unlocks for select using (auth.uid() = user_id);  
+  
+-- Semua mutasi saldo dilakukan melalui server/RPC terkontrol, bukan dari browser.  
+revoke all on function public.fulfill_coin_order(text,text) from public, anon, authenticated;  
+grant execute on function public.fulfill_coin_order(text,text) to service_role;  
+\]
